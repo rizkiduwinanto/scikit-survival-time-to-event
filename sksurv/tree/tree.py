@@ -21,6 +21,7 @@ from ..base import SurvivalAnalysisMixin
 from ..functions import StepFunction
 from ..util import check_array_survival
 from ._criterion import LogrankCriterion, get_unique_times
+from newcriterion import new_criterion
 
 __all__ = ["ExtraSurvivalTree", "SurvivalTree"]
 
@@ -282,6 +283,8 @@ class SurvivalTree(BaseEstimator, SurvivalAnalysisMixin):
     def _fit(self, X, y, sample_weight=None, check_input=True, missing_values_in_feature_mask=None):
         random_state = check_random_state(self.random_state)
 
+        print(y)
+
         if check_input:
             X = self._validate_data(X, dtype=DTYPE, ensure_min_samples=2, accept_sparse="csc", force_all_finite=False)
             event, time = check_array_survival(X, y)
@@ -310,7 +313,8 @@ class SurvivalTree(BaseEstimator, SurvivalAnalysisMixin):
             self.n_classes_ = np.ones(self.n_outputs_, dtype=np.intp) * 2
 
         # Build tree
-        criterion = LogrankCriterion(self.n_outputs_, n_samples, self.unique_times_, self.is_event_time_)
+        criterion = new_criterion(y_numeric, self.n_outputs_, n_samples, self.unique_times_, self.is_event_time_)
+        # criterion = LogrankCriterion(self.n_outputs_, n_samples, self.unique_times_, self.is_event_time_)
 
         SPLITTERS = SPARSE_SPLITTERS if issparse(X) else DENSE_SPLITTERS
 

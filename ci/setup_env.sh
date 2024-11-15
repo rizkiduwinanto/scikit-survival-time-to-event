@@ -1,16 +1,16 @@
 #!/bin/bash
 set -xe
 
-OS="$1"
+# OS="$1"
 
-if [ "x${OS}" = "xLinux" ]; then
-  COMPILER=()
-elif [ "x${OS}" = "xmacOS" ]; then
-  COMPILER=(clang_osx-arm64 clangxx_osx-arm64)
-else
-  echo "OS '${OS}' is unsupported."
-  exit 1
-fi
+# if [ "x${OS}" = "xLinux" ]; then
+#   COMPILER=()
+# elif [ "x${OS}" = "xmacOS" ]; then
+#   COMPILER=(clang_osx-arm64 clangxx_osx-arm64)
+# else
+#   echo "OS '${OS}' is unsupported."
+#   exit 1
+# fi
 
 python ci/render-requirements.py ci/deps/requirements.yaml.tmpl > environment.yaml
 
