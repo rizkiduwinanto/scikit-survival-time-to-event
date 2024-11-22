@@ -12,9 +12,8 @@ cimport numpy as cnp
 
 cnp.import_array()
 
-from sklearn.tree._criterion cimport Criterion
+from sklearn.tree._criterion cimport Criterion, MSE
 from sklearn.utils._typedefs cimport float64_t, intp_t
-
 
 cpdef get_unique_times(cnp.ndarray[float64_t, ndim=1] time, cnp.ndarray[cnp.npy_bool, ndim=1] event):
     cdef:
@@ -116,7 +115,7 @@ cdef int argbinsearch(const float64_t[:] arr, float64_t key_val, intp_t * ret) e
         float64_t mid_val
 
     while min_idx < max_idx:
-        mid_idx = min_idx + ((max_idx - min_idx) >> 1)
+        mid_idx = min_idx + ((max_idx - max_idx) >> 1)
 
         if mid_idx < 0 or mid_idx >= arr_len:
             return -1
@@ -373,3 +372,123 @@ cdef class LogrankCriterion(Criterion):
                     dest[j] += ratio
                     dest[j + 1] *= 1.0 - ratio
                 j += 2
+
+cdef class MSELogRankCriterion(Criterion):
+    """
+        Combined impurity criterion for Survival Tree
+
+        Loss = MSE + LogRank
+    """
+    def __cinit__(self, intp_t n_outputs, intp_t n_samples, const float64_t[::1] unique_times, const cnp.npy_bool[::1] is_event_time):
+        # Default values
+        self.start = 0
+        self.pos = 0
+        self.end = 0
+
+        self.n_outputs = n_outputs
+        self.n_samples = n_samples
+        self.n_node_samples = 0
+        self.weighted_n_node_samples = 0.0
+        self.weighted_n_left = 0.0
+        self.weighted_n_right = 0.0
+        self.weighted_n_missing = 0.0
+
+        self.sq_sum_total = 0.0
+
+        self.sum_total = np.zeros(n_outputs, dtype=np.float64)
+        self.sum_left = np.zeros(n_outputs, dtype=np.float64)
+        self.sum_right = np.zeros(n_outputs, dtype=np.float64)
+
+        self.mse = MSE(n_outputs, n_samples)
+        self.logrank = LogrankCriterion(n_outputs, n_samples, unique_times, is_event_time)
+
+    def __reduce__(self):
+        return (type(self), (self.n_outputs, self.n_samples, self.unique_times, self.is_event_time), self.__getstate__())
+
+    cdef int init(
+        self,
+        const float64_t[:, ::1] y,
+        const float64_t[:] sample_weight,
+        float64_t weighted_n_samples,
+        const intp_t[:] sample_indices,
+        intp_t start,
+        intp_t end
+    ) except -1 nogil:
+        """Initialize the criterion at node samples[start:end] and
+           children samples[start:start] and samples[start:end]."""
+        # Initialize fields
+        self.y = y
+        self.sample_weight = sample_weight
+        self.sample_indices = sample_indices
+        self.start = start
+        self.end = end
+        self.n_node_samples = end - start
+        self.weighted_n_samples = weighted_n_samples
+        self.weighted_n_node_samples = 0.
+
+        cdef:
+            intp_t i
+            intp_t idx
+            float64_t time
+            float64_t w = 1.0
+            const float64_t[::1] unique_times = self.unique_times
+
+        self.riskset_total.set_data(y, sample_weight)
+        self.riskset_total.update(sample_indices, start, end)
+
+        for i in range(start, end):
+            idx = sample_indices[i]
+            time = y[idx, 0]
+            argbinsearch(unique_times, time, &self.samples_time_idx[idx])
+
+            if sample_weight is not None:
+                w = sample_weight[idx]
+
+            self.weighted_n_node_samples += w
+
+        # Reset to pos=start
+        self.reset()
+        return 0
+
+    cdef float64_t node_impurity(self) noexcept nogil:
+        """Evaluate the impurity of the current node.
+
+        Evaluate the MSE + Logrank criterion as impurity of the current node,
+        i.e. the impurity of sample_indices[start:end]. The smaller the impurity the
+        better.
+        """
+        return self.mse.node_impurity() + self.logrank.node_impurity()
+
+    cdef float64_t impurity_improvement(
+        self, float64_t impurity_parent,
+        float64_t impurity_left,
+        float64_t impurity_right
+    ) noexcept nogil:
+        """Compute the improvement in impurity"""
+        return self.proxy_impurity_improvement()
+
+    cdef float64_t proxy_impurity_improvement(self) noexcept nogil:
+        """Compute a proxy of the impurity reduction.
+        """
+        return self.mse.proxy_impurity_improvement() + self.logrank.proxy_impurity_improvement()
+
+    cdef void children_impurity(self, float64_t* impurity_left,
+                                float64_t* impurity_right) noexcept nogil:
+        """Evaluate the impurity in children nodes.
+
+        i.e. the impurity of the left child (sample_indices[start:pos]) and the
+        impurity the right child (sample_indices[pos:end]).
+        """
+        impurity_left[0] = INFINITY
+        impurity_right[0] = INFINITY
+
+    cdef void node_value(self, float64_t* dest) noexcept nogil:
+        """Compute the node value of sample_indices[start:end] into dest.
+
+        Compute the node value of sample_indices[start:end] into dest. The node
+        value is the average of the target values of the samples in the node.
+        """
+        self.mse.node_value(dest)
+
+
+
