@@ -12,8 +12,13 @@ cimport numpy as cnp
 
 cnp.import_array()
 
-from sklearn.tree._criterion cimport Criterion, MSE
+from sklearn.tree._criterion cimport Criterion
+from sklearn.tree._classes import CRITERIA_REG
 from sklearn.utils._typedefs cimport float64_t, intp_t
+
+from libc.stdio cimport printf
+
+MSE_obj = CRITERIA_REG['squared_error']
 
 cpdef get_unique_times(cnp.ndarray[float64_t, ndim=1] time, cnp.ndarray[cnp.npy_bool, ndim=1] event):
     cdef:
@@ -36,7 +41,6 @@ cpdef get_unique_times(cnp.ndarray[float64_t, ndim=1] time, cnp.ndarray[cnp.npy_
             has_event[len(has_event) - 1] = True
 
     return np.asarray(unique_values), np.asarray(has_event, dtype=np.bool_)
-
 
 cdef class RisksetCounter:
     cdef:
@@ -373,13 +377,48 @@ cdef class LogrankCriterion(Criterion):
                     dest[j + 1] *= 1.0 - ratio
                 j += 2
 
+## Try to filter censroed and uncensored Data and dont use mse on censored - Half DONE
+## Add weights and scaling of MSE between 0-1 DONE
+## Prepare for survival time  
+## Investigate log rank node value = INF  
+### Refactor code DONE
+## Add test for MSELogRankCriterion and default to log rank 
+
+
+## compare between Logrank and MSELOGrank using only censored case
+## Plot the loss graphs
+## Switch to MAE (Later)
+
 cdef class MSELogRankCriterion(Criterion):
     """
-        Combined impurity criterion for Survival Tree
+    Combined impurity criterion for Survival Tree
 
-        Loss = MSE + LogRank
+    Loss = MSE(Only Uncensored) + LogRank (All)
     """
-    def __cinit__(self, intp_t n_outputs, intp_t n_samples, const float64_t[::1] unique_times, const cnp.npy_bool[::1] is_event_time):
+    cdef:
+        const float64_t[::1] unique_times
+        const cnp.npy_bool[::1] is_event_time
+        const float64_t[::1] unique_times_uncensored
+        const cnp.npy_bool[::1] is_event_time_uncensored
+        intp_t n_unique_times
+        intp_t nbytes
+        float64_t * weighted_n_events_left
+        float64_t * weighted_delta_n_at_risk_left
+        intp_t * samples_time_idx
+        LogrankCriterion logrank
+        Criterion mse
+
+        float64_t weight_logrank
+        float64_t weight_mse
+
+        float64_t sq_sum_total
+        float64_t[:] sum_total
+        float64_t[:] sum_left
+        float64_t[:] sum_right
+
+        RisksetCounter riskset_total
+
+    def __cinit__(self, intp_t n_outputs, intp_t n_outputs_uncensored, intp_t n_samples, const float64_t[::1] unique_times, const cnp.npy_bool[::1] is_event_time, const float64_t[::1] unique_times_uncensored, const cnp.npy_bool[::1] is_event_time_uncensored):
         # Default values
         self.start = 0
         self.pos = 0
@@ -398,12 +437,34 @@ cdef class MSELogRankCriterion(Criterion):
         self.sum_total = np.zeros(n_outputs, dtype=np.float64)
         self.sum_left = np.zeros(n_outputs, dtype=np.float64)
         self.sum_right = np.zeros(n_outputs, dtype=np.float64)
+       
+        self.n_unique_times = unique_times.shape[0]
+        self.nbytes = self.n_unique_times * sizeof(float64_t)
 
-        self.mse = MSE(n_outputs, n_samples)
+        self.riskset_total = RisksetCounter(unique_times)
+        self.weighted_delta_n_at_risk_left = <float64_t *> malloc(self.nbytes)
+        self.weighted_n_events_left = <float64_t *> malloc(self.nbytes)
+        self.samples_time_idx = <intp_t *> malloc(n_samples * sizeof(intp_t))
+
+        self.weight_logrank = 0.01
+        self.weight_mse = 0.5   
+
+        self.mse = MSE_obj(n_outputs_uncensored, n_samples)
         self.logrank = LogrankCriterion(n_outputs, n_samples, unique_times, is_event_time)
 
+        self.unique_times = unique_times
+        self.is_event_time = is_event_time
+        self.unique_times_uncensored = unique_times_uncensored
+        self.is_event_time_uncensored = is_event_time_uncensored
+
+    def __dealloc__(self):
+        """Destructor."""
+        free(self.weighted_delta_n_at_risk_left)
+        free(self.weighted_n_events_left)
+        free(self.samples_time_idx)
+
     def __reduce__(self):
-        return (type(self), (self.n_outputs, self.n_samples, self.unique_times, self.is_event_time), self.__getstate__())
+        return (type(self), (self.n_outputs, self.n_outputs_uncensored, self.n_samples, self.unique_times, self.is_event_time, self.unique_times_uncensored, self.is_event_time_uncensored), self.__getstate__())
 
     cdef int init(
         self,
@@ -422,7 +483,7 @@ cdef class MSELogRankCriterion(Criterion):
         self.sample_indices = sample_indices
         self.start = start
         self.end = end
-        self.n_node_samples = end - start
+        self.n_node_samples = end - start  
         self.weighted_n_samples = weighted_n_samples
         self.weighted_n_node_samples = 0.
 
@@ -431,6 +492,10 @@ cdef class MSELogRankCriterion(Criterion):
             intp_t idx
             float64_t time
             float64_t w = 1.0
+            intp_t n_uncensored = 0
+            float64_t[:, ::1] y_uncensored 
+            intp_t[:] sample_indices_uncensored
+            intp_t j = 0
             const float64_t[::1] unique_times = self.unique_times
 
         self.riskset_total.set_data(y, sample_weight)
@@ -446,8 +511,76 @@ cdef class MSELogRankCriterion(Criterion):
 
             self.weighted_n_node_samples += w
 
+        self.mse.init(y, sample_weight, weighted_n_samples, sample_indices, start, end)
+        self.logrank.init(y, sample_weight, weighted_n_samples, sample_indices, start, end)
+            
         # Reset to pos=start
         self.reset()
+        return 0
+
+    cdef int reset(self) except -1 nogil:
+        """Reset the criterion at pos=start."""
+        self.weighted_n_left = 0.0
+        self.weighted_n_right = self.weighted_n_node_samples
+        self.pos = self.start
+
+        self.mse.reset()
+        self.logrank.reset()
+
+        return 0
+
+    cdef int reverse_reset(self) except -1 nogil:
+        """Reset the criterion at pos=end."""
+        self.weighted_n_right = 0.0
+        self.weighted_n_left = self.weighted_n_node_samples
+        self.pos = self.end
+
+        self.mse.reverse_reset()
+        self.logrank.reverse_reset()
+        
+        return 0
+
+    cdef int update(self, intp_t new_pos) except -1 nogil:
+        """Updated statistics by moving samples[pos:new_pos] to the left."""
+        cdef:
+            const float64_t[:] sample_weight = self.sample_weight
+            const intp_t[:] samples = self.sample_indices
+            const float64_t[:, ::1] y = self.y
+
+            intp_t pos = self.start  # always start from the beginning
+            intp_t i
+            intp_t idx
+            float64_t event
+            intp_t time_idx
+            float64_t w = 1.0
+
+        memset(self.weighted_delta_n_at_risk_left, 0, self.nbytes)
+        memset(self.weighted_n_events_left, 0, self.nbytes)
+
+        # Update statistics up to new_pos
+        self.weighted_n_left = 0.0
+        for i in range(pos, new_pos):
+            idx = samples[i]
+            event = y[idx, 1]
+            time_idx = self.samples_time_idx[idx]
+
+            if sample_weight is not None:
+                w = sample_weight[idx]
+
+            self.weighted_delta_n_at_risk_left[time_idx] += w
+            if event != 0.0:
+                self.weighted_n_events_left[time_idx] += w
+
+            self.weighted_n_left += w
+
+        self.weighted_n_right = (self.weighted_n_node_samples -
+                                 self.weighted_n_left)
+
+        self.pos = new_pos
+
+        self.mse.update(new_pos)
+        self.logrank.update(new_pos)
+    
         return 0
 
     cdef float64_t node_impurity(self) noexcept nogil:
@@ -470,7 +603,13 @@ cdef class MSELogRankCriterion(Criterion):
     cdef float64_t proxy_impurity_improvement(self) noexcept nogil:
         """Compute a proxy of the impurity reduction.
         """
-        return self.mse.proxy_impurity_improvement() + self.logrank.proxy_impurity_improvement()
+        cdef float64_t log_rank_impurity
+        cdef float64_t mse_impurity
+
+        log_rank_impurity = self.logrank.proxy_impurity_improvement()
+        mse_impurity = self.mse.proxy_impurity_improvement()
+
+        return self.weight_logrank * log_rank_impurity + self.weight_mse * mse_impurity
 
     cdef void children_impurity(self, float64_t* impurity_left,
                                 float64_t* impurity_right) noexcept nogil:
@@ -479,8 +618,8 @@ cdef class MSELogRankCriterion(Criterion):
         i.e. the impurity of the left child (sample_indices[start:pos]) and the
         impurity the right child (sample_indices[pos:end]).
         """
-        impurity_left[0] = INFINITY
-        impurity_right[0] = INFINITY
+        self.mse.children_impurity(impurity_left, impurity_right)
+        self.logrank.children_impurity(impurity_left, impurity_right)
 
     cdef void node_value(self, float64_t* dest) noexcept nogil:
         """Compute the node value of sample_indices[start:end] into dest.
@@ -488,6 +627,7 @@ cdef class MSELogRankCriterion(Criterion):
         Compute the node value of sample_indices[start:end] into dest. The node
         value is the average of the target values of the samples in the node.
         """
+        self.logrank.node_value(dest)
         self.mse.node_value(dest)
 
 

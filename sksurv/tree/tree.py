@@ -182,7 +182,7 @@ class SurvivalTree(BaseEstimator, SurvivalAnalysisMixin):
     def __init__(
         self,
         *,
-        criterion="mixed",
+        criterion="logrank",
         splitter="best",
         max_depth=None,
         min_samples_split=6,
@@ -286,6 +286,7 @@ class SurvivalTree(BaseEstimator, SurvivalAnalysisMixin):
 
         if check_input:
             X = self._validate_data(X, dtype=DTYPE, ensure_min_samples=2, accept_sparse="csc", force_all_finite=False)
+
             event, time = check_array_survival(X, y)
             time = time.astype(np.float64)
             self.unique_times_, self.is_event_time_ = get_unique_times(time, event)
@@ -296,6 +297,9 @@ class SurvivalTree(BaseEstimator, SurvivalAnalysisMixin):
             y_numeric = np.empty((X.shape[0], 2), dtype=np.float64)
             y_numeric[:, 0] = time
             y_numeric[:, 1] = event.astype(np.float64)
+
+            y_uncensored = np.array([(event, time.astype(np.float64)) for event, time in y if event])
+            self.unique_times_uncensored_, self.is_event_time__uncensored_ = get_unique_times(time, event)
         else:
             y_numeric, self.unique_times_, self.is_event_time_ = y
 
@@ -308,6 +312,7 @@ class SurvivalTree(BaseEstimator, SurvivalAnalysisMixin):
             self.n_classes_ = np.ones(self.n_outputs_, dtype=np.intp)
         else:
             self.n_outputs_ = self.unique_times_.shape[0]
+            self.n_outputs_uncensored_ = self.unique_times_uncensored_.shape[0]
             # one "class" for CHF, one for survival function
             self.n_classes_ = np.ones(self.n_outputs_, dtype=np.intp) * 2
 
@@ -315,7 +320,7 @@ class SurvivalTree(BaseEstimator, SurvivalAnalysisMixin):
         if self.criterion == 'logrank':
             criterion = LogrankCriterion(self.n_outputs_, n_samples, self.unique_times_, self.is_event_time_)
         else:
-            criterion = MSELogRankCriterion(self.n_outputs_, n_samples, self.unique_times_, self.is_event_time_)
+            criterion = MSELogRankCriterion(self.n_outputs_, self.n_outputs_uncensored_, n_samples, self.unique_times_, self.is_event_time_, self.unique_times_uncensored_, self.is_event_time__uncensored_)
 
         SPLITTERS = SPARSE_SPLITTERS if issparse(X) else DENSE_SPLITTERS
 
